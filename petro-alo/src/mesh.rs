@@ -5,14 +5,11 @@ use std::str::FromStr;
 use anyhow::Context;
 use bitflags::bitflags;
 use glam::Vec3;
-use petro_chunked::ChunkContent;
-use petro_chunked::byteblock::{ConvertBytes, TakeBytes};
 use thiserror::Error;
 
 use crate::alternatives::{Alt, Lod, LodGroup};
 use crate::error::FormatError;
-use crate::ids;
-use crate::primitives::{U32Bool, U32Usize, U32UsizeVec};
+use crate::raw;
 
 /// Bounding box for a mesh.
 #[derive(Default, Debug, Copy, Clone)]
@@ -45,43 +42,18 @@ pub struct Mesh {
 }
 
 impl Mesh {
-    pub(crate) fn parse(content: ChunkContent) -> anyhow::Result<Self> {
-        let mut chunks = content.children().context("parsing mesh")?;
+    pub(crate) fn from_raw(raw: raw::Mesh<'_>) -> anyhow::Result<Self> {
+        let submesh_count = raw.info.submesh_count;
+        if raw.submeshes.len() != submesh_count {
+            Err(FormatError::WrongContentCount {
+                expected: submesh_count,
+                actual: raw.submeshes.len(),
+            })?;
+        }
 
-        #[derive(Error, Debug, Copy, Clone)]
-        #[error("parsing the mesh name (chunk 00000401)")]
-        struct MeshNameCtx;
-
-        let name: String = chunks
-            .expect_chunk(ids::MESH_NAME)
-            .context(MeshNameCtx)?
-            .data()
-            .context(MeshNameCtx)?
-            .convert()
-            .context(MeshNameCtx)?;
-
-        #[derive(Error, Debug, Copy, Clone)]
-        #[error("parsing the mesh info (chunk 00000402)")]
-        struct MeshInfoCtx;
-
-        type MeshInfo<'b> = (U32Usize, [[f32; 3]; 2], u32, U32Bool, U32Bool, &'b [u8; 88]);
-        let (
-            U32Usize(submesh_count),
-            bounds,
-            _unused,
-            U32Bool(hidden),
-            U32Bool(collision_enabled),
-            _padding,
-        ): MeshInfo = chunks
-            .expect_chunk(ids::MESH_INFO)
-            .context(MeshInfoCtx)?
-            .data()
-            .context(MeshInfoCtx)?
-            .convert()
-            .context(MeshInfoCtx)?;
         let bounds = BoundingBox {
-            start: Vec3::from_array(bounds[0]),
-            end: Vec3::from_array(bounds[1]),
+            start: raw.info.bounds[0],
+            end: raw.info.bounds[1],
         };
 
         #[derive(Error, Debug, Copy, Clone)]
@@ -91,20 +63,17 @@ impl Mesh {
             submesh_idx: usize,
         }
 
-        let mut submeshes = Vec::new();
-        for submesh_idx in 0..submesh_count {
+        let mut submeshes = Vec::with_capacity(submesh_count);
+        for (submesh_idx, raw_submesh) in raw.submeshes.into_iter().enumerate() {
             let ctx = SubmeshCtx {
                 submesh_count,
                 submesh_idx,
             };
-            let mat = chunks.expect_chunk(ids::SUBMESH_MATERIAL).context(ctx)?;
-            let data = chunks.expect_chunk(ids::SUBMESH_DATA).context(ctx)?;
-            let submesh = Submesh::parse(mat.content(), data.content()).context(ctx)?;
+            let submesh = Submesh::from_raw(raw_submesh).context(ctx)?;
             submeshes.push(submesh);
         }
 
-        chunks.expect_empty().context("after parsing submeshes")?;
-
+        let name = raw.name.to_owned();
         Ok(Mesh {
             lod: Lod::from_name(&name),
             // Actual group will be decided later.
@@ -112,8 +81,8 @@ impl Mesh {
             alt: Alt::from_name(&name),
             name,
             bounds,
-            hidden,
-            collision_enabled,
+            hidden: raw.info.hidden,
+            collision_enabled: raw.info.collision_enabled,
             submeshes,
             // Parent bones will be attached later, when reading the connections chunk.
             parent_bone: 0,
@@ -214,144 +183,67 @@ pub struct Submesh {
 }
 
 impl Submesh {
-    /// Parse a Submesh from the materials and data chunks.
-    fn parse(materials: ChunkContent, data: ChunkContent) -> anyhow::Result<Self> {
+    /// Convert a raw submesh into a validated `Submesh`.
+    fn from_raw(raw: raw::Submesh<'_>) -> anyhow::Result<Self> {
         let shader =
-            Shader::parse(materials).context("parsing the submesh material information")?;
+            Shader::from_raw(raw.material).context("parsing the submesh material information")?;
 
-        let mut data = data.children()?;
+        let num_vertices = raw.data.info.num_vertices;
+        let num_primitives = raw.data.info.num_primitives;
 
-        #[derive(Error, Debug, Copy, Clone)]
-        #[error("parsing the submesh info (chunk 00010001)")]
-        struct SubmeshInfoCtx;
-        let (U32Usize(num_vertices), U32Usize(num_primitives), _padding): (_, _, &[u8; 120]) = data
-            .expect_chunk(ids::SUBMESH_INFO)
-            .context(SubmeshInfoCtx)?
-            .data()
-            .context(SubmeshInfoCtx)?
-            .convert()
-            .context(SubmeshInfoCtx)?;
+        let vertex_format_string = raw.data.vertex_format.to_owned();
+        let vertex_format = vertex_format_string
+            .parse()
+            .context("parsing the submesh vertex format (chunk 00010002)")?;
 
-        #[derive(Error, Debug, Copy, Clone)]
-        #[error("parsing the submesh vertex format (chunk 00010002)")]
-        struct VertexFmtCtx;
-        let vertex_format_string: String = data
-            .expect_chunk(ids::SUBMESH_VERTEX_FORMAT)
-            .context(VertexFmtCtx)?
-            .data()
-            .context(VertexFmtCtx)?
-            .convert()
-            .context(VertexFmtCtx)?;
-        let vertex_format = vertex_format_string.parse().context(VertexFmtCtx)?;
-
-        let mut submesh = Submesh {
-            shader,
-            vertex_format_string,
-            vertex_format,
-            primitives: Vec::new(),
-            bone_mappings: Vec::new(),
-            vertex_data: SubmeshVertexData::with_capacity(num_vertices),
-        };
-
-        loop {
-            let chunk = data.try_expect_chunk([
-                ids::SUBMESH_INDEX_BUF,
-                ids::SUBMESH_ANIM_MAP,
-                ids::SUBMESH_VERTEX_BUF_V1,
-                ids::SUBMESH_VERTEX_BUF_V2,
-                ids::SUBMESH_COLLISION,
-            ])?;
-            let chunk = match chunk {
-                Some(chunk) => chunk,
-                None => break,
-            };
-            match chunk.id() {
-                ids::SUBMESH_INDEX_BUF => {
-                    submesh
-                        .parse_index_buf(chunk.content(), num_primitives)
-                        .context("parsing the submesh index buffer (chunk 00010004)")?;
-                }
-                ids::SUBMESH_ANIM_MAP => {
-                    submesh
-                        .parse_bone_mapping(chunk.content())
-                        .context("parsing the submesh animation mapping (chunk 00010006)")?;
-                }
-                ids::SUBMESH_VERTEX_BUF_V1 => {
-                    submesh
-                        .vertex_data
-                        .parse_v1(chunk.content(), num_vertices)
-                        .context("parsing the submesh v1 vertex buffer (chunk 00010005)")?;
-                }
-                ids::SUBMESH_VERTEX_BUF_V2 => {
-                    submesh
-                        .vertex_data
-                        .parse_v2(chunk.content(), num_vertices)
-                        .context("parsing the submesh v1 vertex buffer (chunk 00010007)")?;
-                }
-                ids::SUBMESH_COLLISION => {}
-                _ => unreachable!(),
-            }
-        }
-
-        data.expect_empty()?;
-
-        if submesh.primitives.is_empty() {
+        let primitives = raw.data.primitives;
+        if primitives.is_empty() {
             Err(FormatError::MissingPrimitives)?;
         }
-        if submesh.vertex_data.positions.is_empty() {
+        if primitives.len() != num_primitives {
+            Err(FormatError::WrongContentCount {
+                expected: num_primitives,
+                actual: primitives.len(),
+            })
+            .context("parsing the submesh index buffer (chunk 00010004)")?;
+        }
+
+        let mut vertex_data = SubmeshVertexData::from_raw(raw.data.vertices, num_vertices)?;
+        if vertex_data.positions.is_empty() {
             Err(FormatError::MissingVertices)?;
         }
-        for prim in &submesh.primitives {
+
+        for prim in &primitives {
             for &idx in prim {
-                if idx as usize >= submesh.vertex_data.positions.len() {
+                if idx as usize >= vertex_data.positions.len() {
                     Err(FormatError::PrimitiveIndexOutOfRange {
                         idx,
-                        len: submesh.vertex_data.positions.len(),
+                        len: vertex_data.positions.len(),
                     })?;
                 }
             }
         }
-        if !submesh.bone_mappings.is_empty() {
-            let bone_index_count = submesh.bone_mappings.len().min(u16::MAX as usize) as u16;
-            for (bidx, &bwt) in submesh
-                .vertex_data
+
+        let bone_mappings = raw.data.bone_mappings;
+        if !bone_mappings.is_empty() {
+            let bone_index_count = bone_mappings.len().min(u16::MAX as usize) as u16;
+            for (bidx, &bwt) in vertex_data
                 .bone_indices
                 .iter_mut()
-                .zip(submesh.vertex_data.bone_weights.iter())
+                .zip(vertex_data.bone_weights.iter())
             {
                 *bidx = squash_bone_indices(*bidx, bwt, bone_index_count)?;
             }
         }
 
-        Ok(submesh)
-    }
-
-    fn parse_index_buf(&mut self, data: ChunkContent, expected: usize) -> anyhow::Result<()> {
-        if !self.primitives.is_empty() {
-            Err(FormatError::DuplicateChunk {
-                id: ids::SUBMESH_INDEX_BUF,
-            })?;
-        }
-        self.primitives = data.data()?.convert()?;
-
-        if self.primitives.len() != expected {
-            Err(FormatError::WrongContentCount {
-                expected,
-                actual: self.primitives.len(),
-            })?;
-        }
-        Ok(())
-    }
-
-    fn parse_bone_mapping(&mut self, data: ChunkContent) -> anyhow::Result<()> {
-        if !self.bone_mappings.is_empty() {
-            Err(FormatError::DuplicateChunk {
-                id: ids::SUBMESH_ANIM_MAP,
-            })?;
-        }
-        let U32UsizeVec(value) = data.data()?.convert()?;
-        self.bone_mappings = value;
-        Ok(())
+        Ok(Submesh {
+            shader,
+            vertex_format_string,
+            vertex_format,
+            primitives,
+            bone_mappings,
+            vertex_data,
+        })
     }
 }
 
@@ -389,116 +281,61 @@ impl SubmeshVertexData {
         }
     }
 
-    /// Parse v1 vertex data into self, errors if self already contains vertex data or the amount of
-    /// data read doesn't match what is expected.
-    fn parse_v1(&mut self, data: ChunkContent, expected: usize) -> anyhow::Result<()> {
-        type VertexV1 = (
-            // Position
-            [f32; 3],
-            // Normal
-            [f32; 3],
-            // Tex coords
-            [[f32; 2]; 4],
-            // Tangent
-            [f32; 3],
-            // Binormal
-            [f32; 3],
-            // Color
-            [f32; 4],
-            // Bone indices
-            [u32; 4],
-            // Bone weights
-            [f32; 4],
-        );
-
-        if !self.positions.is_empty() {
-            Err(FormatError::DuplicateChunk {
-                id: ids::SUBMESH_VERTEX_BUF_V1,
-            })?;
+    fn from_raw(raw: raw::VertexBuffer, expected: usize) -> anyhow::Result<Self> {
+        let mut out = Self::with_capacity(expected);
+        match raw {
+            raw::VertexBuffer::V1(verts) => {
+                if verts.len() != expected {
+                    Err(FormatError::WrongContentCount {
+                        expected,
+                        actual: verts.len(),
+                    })
+                    .context("parsing the submesh v1 vertex buffer (chunk 00010005)")?;
+                }
+                for v in verts {
+                    let bidx = squash_bone_indices(v.bone_indices, v.bone_weights, u16::MAX)
+                        .context("parsing the submesh v1 vertex buffer (chunk 00010005)")?;
+                    let [t0, t1, t2, t3] = v.tex_coords;
+                    out.positions.push(v.position);
+                    out.normals.push(v.normal);
+                    out.tex_coords[0].push(t0);
+                    out.tex_coords[1].push(t1);
+                    out.tex_coords[2].push(t2);
+                    out.tex_coords[3].push(t3);
+                    out.tangents.push(v.tangent);
+                    out.binormals.push(v.binormal);
+                    out.colors.push(v.color);
+                    out.bone_indices.push(bidx);
+                    out.bone_weights.push(v.bone_weights);
+                }
+            }
+            raw::VertexBuffer::V2(verts) => {
+                if verts.len() != expected {
+                    Err(FormatError::WrongContentCount {
+                        expected,
+                        actual: verts.len(),
+                    })
+                    .context("parsing the submesh v2 vertex buffer (chunk 00010007)")?;
+                }
+                for v in verts {
+                    let bidx = squash_bone_indices(v.bone_indices, v.bone_weights, u16::MAX)
+                        .context("parsing the submesh v2 vertex buffer (chunk 00010007)")?;
+                    let [t0, t1, t2, t3] = v.tex_coords;
+                    out.positions.push(v.position);
+                    out.normals.push(v.normal);
+                    out.tex_coords[0].push(t0);
+                    out.tex_coords[1].push(t1);
+                    out.tex_coords[2].push(t2);
+                    out.tex_coords[3].push(t3);
+                    out.tangents.push(v.tangent);
+                    out.binormals.push(v.binormal);
+                    out.colors.push(v.color);
+                    out.bone_indices.push(bidx);
+                    out.bone_weights.push(v.bone_weights);
+                }
+            }
         }
-
-        let mut vert_data = data.data()?.as_data();
-        while !vert_data.is_empty() {
-            let (pos, norm, [t0, t1, t2, t3], tan, binorm, col, bidx, bwt): VertexV1 =
-                vert_data.take()?;
-            let bidx = squash_bone_indices(bidx, bwt, u16::MAX)?;
-            self.positions.push(pos);
-            self.normals.push(norm);
-            self.tex_coords[0].push(t0);
-            self.tex_coords[1].push(t1);
-            self.tex_coords[2].push(t2);
-            self.tex_coords[3].push(t3);
-            self.tangents.push(tan);
-            self.binormals.push(binorm);
-            self.colors.push(col);
-            self.bone_indices.push(bidx);
-            self.bone_weights.push(bwt);
-        }
-
-        if self.positions.len() != expected {
-            Err(FormatError::WrongContentCount {
-                expected,
-                actual: self.positions.len(),
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Parse v2 vertex data into self, errors if self already contains vertex data or the amount of
-    /// data read doesn't match what is expected.
-    fn parse_v2(&mut self, data: ChunkContent, expected: usize) -> anyhow::Result<()> {
-        type VertexV2 = (
-            // Position
-            [f32; 3],
-            // Normal
-            [f32; 3],
-            // Tex coords
-            [[f32; 2]; 4],
-            // Tangent
-            [f32; 3],
-            // Binormal
-            [f32; 3],
-            // Color
-            [f32; 4],
-            // Unused.
-            [f32; 4],
-            // Bone indices
-            [u32; 4],
-            // Bone weights
-            [f32; 4],
-        );
-
-        if !self.positions.is_empty() {
-            Err(FormatError::DuplicateChunk {
-                id: ids::SUBMESH_VERTEX_BUF_V2,
-            })?;
-        }
-
-        let mut vert_data = data.data()?.as_data();
-        while !vert_data.is_empty() {
-            let (pos, norm, [t0, t1, t2, t3], tan, binorm, col, _unused, bidx, bwt): VertexV2 =
-                vert_data.take()?;
-            let bidx = squash_bone_indices(bidx, bwt, u16::MAX)?;
-            self.positions.push(pos);
-            self.normals.push(norm);
-            self.tex_coords[0].push(t0);
-            self.tex_coords[1].push(t1);
-            self.tex_coords[2].push(t2);
-            self.tex_coords[3].push(t3);
-            self.tangents.push(tan);
-            self.binormals.push(binorm);
-            self.colors.push(col);
-            self.bone_indices.push(bidx);
-            self.bone_weights.push(bwt);
-        }
-
-        if self.positions.len() != expected {
-            Err(FormatError::WrongContentCount {
-                expected,
-                actual: self.positions.len(),
-            })?;
-        }
-        Ok(())
+        Ok(out)
     }
 }
 
@@ -541,73 +378,31 @@ pub struct Shader {
 }
 
 impl Shader {
-    fn parse(materials: ChunkContent) -> anyhow::Result<Self> {
-        let mut materials = materials.children()?;
-
-        #[derive(Error, Debug, Copy, Clone)]
-        #[error("parsing the submesh material shader name (chunk 00010101)")]
-        struct ShaderNameCtx;
-        let filename: String = materials
-            .expect_chunk(ids::SUBMESH_MATERIAL_SHADER_NAME)
-            .context(ShaderNameCtx)?
-            .data()
-            .context(ShaderNameCtx)?
-            .convert()
-            .context(ShaderNameCtx)?;
-
-        #[derive(Error, Debug, Copy, Clone)]
-        #[error("parsing the submesh material parameter in chunk {id:0>8x}")]
-        struct ShaderParamCtx {
-            id: u32,
-        }
-
-        let mut params = HashMap::new();
-        while let Some(chunk) = materials
-            .try_expect_chunk([
-                ids::SUBMESH_MATERIAL_INT_PARAM,
-                ids::SUBMESH_MATERIAL_FLOAT_PARAM,
-                ids::SUBMESH_MATERIAL_FLOAT3_PARAM,
-                ids::SUBMESH_MATERIAL_TEX_PARAM,
-                ids::SUBMESH_MATERIAL_FLOAT4_PARAM,
-            ])
-            .context("reading shader params")?
-        {
-            let ctx = ShaderParamCtx { id: chunk.id() };
-            let mut content = chunk.data().context(ctx)?.as_mini_chunks();
-            let name = content
-                .expect_chunk(ids::SUBMESH_MATERIAL_PARAM_NAME)
-                .context(ctx)?
-                .convert()
-                .context(ctx)?;
-            if params.contains_key(&name) {
-                return Err(FormatError::DuplicateShaderParam { name }).context(ctx)?;
-            }
-            let value = content
-                .expect_chunk(ids::SUBMESH_MATERIAL_PARAM_VALUE)
-                .context(ctx)?;
-            let value = match chunk.id() {
-                ids::SUBMESH_MATERIAL_INT_PARAM => ShaderParam::Int(value.convert().context(ctx)?),
-                ids::SUBMESH_MATERIAL_FLOAT_PARAM => {
-                    ShaderParam::Float(value.convert().context(ctx)?)
+    fn from_raw(raw: raw::Shader<'_>) -> anyhow::Result<Self> {
+        let mut params = HashMap::with_capacity(raw.params.len());
+        for param in raw.params {
+            let (name, value) = match param {
+                raw::ShaderParam::Int(entry) => (entry.name, ShaderParam::Int(entry.value)),
+                raw::ShaderParam::Float(entry) => (entry.name, ShaderParam::Float(entry.value)),
+                raw::ShaderParam::Float3(entry) => (entry.name, ShaderParam::Float3(entry.value)),
+                raw::ShaderParam::Texture(entry) => {
+                    (entry.name, ShaderParam::Texture(entry.value.to_owned()))
                 }
-                ids::SUBMESH_MATERIAL_FLOAT3_PARAM => {
-                    ShaderParam::Float3(value.convert().context(ctx)?)
-                }
-                ids::SUBMESH_MATERIAL_TEX_PARAM => {
-                    ShaderParam::Texture(value.convert().context(ctx)?)
-                }
-                ids::SUBMESH_MATERIAL_FLOAT4_PARAM => {
-                    ShaderParam::Float4(value.convert().context(ctx)?)
-                }
-                _ => unreachable!(),
+                raw::ShaderParam::Float4(entry) => (entry.name, ShaderParam::Float4(entry.value)),
             };
-            params.insert(name, value);
+            if params.contains_key(name) {
+                return Err(FormatError::DuplicateShaderParam {
+                    name: name.to_owned(),
+                }
+                .into());
+            }
+            params.insert(name.to_owned(), value);
         }
-        materials
-            .expect_empty()
-            .context("after reading shader parameters")?;
 
-        Ok(Self { filename, params })
+        Ok(Self {
+            filename: raw.filename.to_owned(),
+            params,
+        })
     }
 }
 

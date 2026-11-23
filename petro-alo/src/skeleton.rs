@@ -1,13 +1,11 @@
 use anyhow::Context;
 use glam::{Mat4, Vec4};
-use petro_chunked::ChunkContent;
-use petro_chunked::byteblock::{ConvertBytes, FromByteBlock};
+use petro_chunked::byteblock::FromByteBlock;
 use thiserror::Error;
 
 use crate::alternatives::Alt;
 use crate::error::FormatError;
-use crate::ids;
-use crate::primitives::{U32Bool, U32Usize};
+use crate::raw;
 
 /// How a bone should apply billboarding.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
@@ -89,37 +87,11 @@ pub struct Bone {
 }
 
 impl Bone {
-    fn parse(content: ChunkContent, existing_bones: &[Bone]) -> anyhow::Result<Self> {
-        let mut chunks = content.children()?;
-
-        #[derive(Error, Debug, Copy, Clone)]
-        #[error("parsing the bone name (chunk 00000203)")]
-        struct BoneNameCtx;
-        let name = chunks
-            .expect_chunk(ids::BONE_NAME)
-            .context(BoneNameCtx)?
-            .data()
-            .context(BoneNameCtx)?
-            .convert()
-            .context(BoneNameCtx)?;
-
-        #[derive(Error, Debug, Copy, Clone)]
-        #[error("parsing the bone data (chunk 00000205 or 00000206)")]
-        struct BoneDataCtx;
-
-        let bone_data = chunks
-            .expect_chunk([ids::BONE_V1, ids::BONE_V2])
-            .context(BoneDataCtx)?;
-        let content = bone_data.data().context(BoneDataCtx)?.as_data();
-        let (parent, U32Bool(visible), billboard, matrix): (u32, _, _, [[f32; 4]; 3]) =
-            match bone_data.id() {
-                ids::BONE_V1 => {
-                    let (parent, visible, matrix) = content.convert().context(BoneDataCtx)?;
-                    (parent, visible, BillboardMode::Disable, matrix)
-                }
-                ids::BONE_V2 => content.convert().context(BoneDataCtx)?,
-                _ => unreachable!(),
-            };
+    fn from_raw(raw: raw::Bone<'_>, existing_bones: &[Bone]) -> anyhow::Result<Self> {
+        let (parent, visible, billboard, matrix) = match raw.data {
+            raw::BoneData::V1(v1) => (v1.parent, v1.visible, BillboardMode::Disable, v1.matrix),
+            raw::BoneData::V2(v2) => (v2.parent, v2.visible, v2.billboard, v2.matrix),
+        };
         let (parent, parent_to_global) = match parent {
             u32::MAX => {
                 // Only the first bone is parentless.
@@ -155,12 +127,8 @@ impl Bone {
         .transpose();
         let local_to_global = parent_to_global * local_to_parent;
 
-        chunks
-            .expect_empty()
-            .context("after parsing the bone content")?;
-
         Ok(Bone {
-            name,
+            name: raw.name.to_owned(),
             parent,
             visible,
             billboard,
@@ -179,20 +147,14 @@ pub struct Skeleton {
 }
 
 impl Skeleton {
-    pub(crate) fn parse(content: ChunkContent) -> anyhow::Result<Self> {
-        let mut chunks = content.children().context("parsing skeleton")?;
-
-        #[derive(Error, Debug, Copy, Clone)]
-        #[error("parsing the bone count (chunk 00000201)")]
-        struct BoneCountCtx;
-
-        let (U32Usize(bone_count), _pad): (_, &[u8; 124]) = chunks
-            .expect_chunk(ids::BONE_COUNT)
-            .context(BoneCountCtx)?
-            .data()
-            .context(BoneCountCtx)?
-            .convert()
-            .context(BoneCountCtx)?;
+    pub(crate) fn from_raw(raw: raw::Skeleton<'_>) -> anyhow::Result<Self> {
+        let bone_count = raw.header.bone_count;
+        if raw.bones.len() != bone_count {
+            Err(FormatError::WrongContentCount {
+                expected: bone_count,
+                actual: raw.bones.len(),
+            })?;
+        }
 
         #[derive(Error, Debug, Copy, Clone)]
         #[error("parsing bone {bone_idx} / {bone_count}")]
@@ -202,19 +164,14 @@ impl Skeleton {
         }
 
         let mut bones = Vec::with_capacity(bone_count);
-        for bone_idx in 0..bone_count {
+        for (bone_idx, raw_bone) in raw.bones.into_iter().enumerate() {
             let ctx = BoneCtx {
                 bone_count,
                 bone_idx,
             };
-            let chunk = chunks.expect_chunk(ids::BONE).context(ctx)?;
-            let bone = Bone::parse(chunk.content(), &bones).context(ctx)?;
-
+            let bone = Bone::from_raw(raw_bone, &bones).context(ctx)?;
             bones.push(bone);
         }
-        chunks
-            .expect_empty()
-            .context("after parsing the expected number of bones")?;
 
         Ok(Self { bones })
     }

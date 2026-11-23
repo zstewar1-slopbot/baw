@@ -5,7 +5,6 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Context;
-use petro_chunked::{iter_chunks, minichunk};
 use thiserror::Error;
 
 use crate::alternatives::{Alt, Lod, LodGroup};
@@ -14,7 +13,6 @@ use crate::connections::Connections;
 pub use crate::error::AloError;
 use crate::error::FormatError;
 use crate::mesh::Mesh;
-use crate::primitives::U32Usize;
 use crate::skeleton::{Proxy, Skeleton};
 
 pub mod alternatives;
@@ -23,7 +21,7 @@ mod connections;
 mod error;
 mod ids;
 pub mod mesh;
-mod primitives;
+pub mod raw;
 pub mod skeleton;
 
 /// An ALO model or particle system.
@@ -35,74 +33,50 @@ pub struct AloFile {
 
 impl AloFile {
     pub fn parse(bytes: &[u8]) -> Result<Self, AloError> {
-        let mut chunks = iter_chunks(bytes);
+        let raw = raw::AloFile::parse(bytes).context("parsing raw ALO chunk structure")?;
+        Ok(Self::from_raw(raw)?)
+    }
 
+    pub fn from_raw(raw: raw::AloFile<'_>) -> anyhow::Result<Self> {
         #[derive(Copy, Clone)]
         enum ConnectionIdx {
             Mesh(usize),
             Light(#[allow(unused)] usize),
         }
 
-        let mut skeleton = None;
+        let mut skeleton = match raw.skeleton {
+            Some(raw_skel) => Skeleton::from_raw(raw_skel).context("parsing skeleton")?,
+            None => Skeleton::default(),
+        };
+
         let mut meshes = Vec::new();
         let mut lights = 0;
-        let mut connection_indices = Vec::new();
-        let mut connections = None;
+        let mut connection_indices = Vec::with_capacity(raw.objects.len());
 
-        loop {
-            let chunk = chunks
-                .try_expect_chunk([
-                    ids::SKELETON,
-                    ids::MESH,
-                    ids::LIGHT,
-                    ids::CONNECTION,
-                    ids::PARTICLES,
-                ])
-                .context("getting a chunk from the top level of the ALO file")?;
-            let chunk = match chunk {
-                Some(chunk) => chunk,
-                None => break,
-            };
-
-            match chunk.id() {
-                ids::SKELETON => {
-                    if skeleton.is_some() {
-                        Err(FormatError::DuplicateChunk { id: chunk.id() })
-                            .context("already found a skeleton chunk")?;
-                    }
-                    skeleton = Some(Skeleton::parse(chunk.content())?);
-                }
-                ids::MESH => {
+        for obj in raw.objects {
+            match obj {
+                raw::Object::Mesh(raw_mesh) => {
                     #[derive(Error, Debug)]
                     #[error("parsing mesh {idx}")]
                     struct MeshCtx {
                         idx: usize,
                     }
-                    let mesh =
-                        Mesh::parse(chunk.content()).context(MeshCtx { idx: meshes.len() })?;
-                    connection_indices.push(ConnectionIdx::Mesh(meshes.len()));
+                    let idx = meshes.len();
+                    let mesh = Mesh::from_raw(raw_mesh).context(MeshCtx { idx })?;
+                    connection_indices.push(ConnectionIdx::Mesh(idx));
                     meshes.push(mesh);
                 }
-                ids::LIGHT => {
+                raw::Object::Light => {
                     connection_indices.push(ConnectionIdx::Light(lights));
                     lights += 1;
                 }
-                ids::CONNECTION => {
-                    if connections.is_some() {
-                        Err(FormatError::DuplicateChunk { id: chunk.id() })
-                            .context("already found a connection chunk")?;
-                    }
-                    connections = Some(Connections::parse(chunk.content())?);
-                }
-                _ => {}
             }
         }
 
-        chunks
-            .expect_empty()
-            .context("leftover chunks at the top level of the ALO file")?;
-
-        let mut skeleton = skeleton.unwrap_or_default();
+        let connections = match raw.connections {
+            Some(raw_conn) => Some(Connections::from_raw(raw_conn).context("parsing connections")?),
+            None => None,
+        };
 
         #[derive(Error, Debug, Copy, Clone)]
         #[error("validating submesh {smidx} of mesh {midx}")]
@@ -196,7 +170,7 @@ impl AloFile {
                     alt_decrease_stay_hidden: proxy_conn.alt_decrease_stay_hidden,
                 });
             }
-        } else if meshes.len() > 0 || lights > 0 {
+        } else if !meshes.is_empty() || lights > 0 {
             Err(FormatError::MissingChunk {
                 id: ids::CONNECTION,
             })?;
@@ -217,61 +191,7 @@ pub struct AlaFile {
 
 impl AlaFile {
     pub fn parse(bytes: &[u8]) -> Result<Self, AloError> {
-        let mut chunks = iter_chunks(bytes);
-        let root = chunks
-            .expect_chunk(ids::ANIMATION_ROOT)
-            .context("Getting the root animation chunk from the ALA file")?;
-
-        chunks
-            .expect_empty()
-            .context("Expected only one top-level chunk")?;
-
-        let mut chunks = root
-            .children()
-            .context("Getting the children of the root chunk")?;
-
-        #[derive(Error, Debug, Copy, Clone)]
-        #[error("Getting the header (chunk 0x00001001")]
-        struct AnimationHeaderCtx;
-
-        let (
-            U32Usize(num_frames),
-            fps,
-            U32Usize(num_bones),
-            rot_frame_size,
-            tra_frame_size,
-            sca_frame_size,
-        ) = chunks
-            .expect_chunk(ids::ANIMATION_HEADER)
-            .context(AnimationHeaderCtx)?
-            .data()
-            .context(AnimationHeaderCtx)?
-            .as_mini_chunks()
-            .expect_sequence((
-                minichunk::require(ids::ANIMATION_HEADER_NUM_FRAMES),
-                minichunk::require::<f32>(ids::ANIMATION_HEADER_FPS),
-                minichunk::require(ids::ANIMATION_HEADER_NUM_BONES),
-                minichunk::opt(ids::ANIMATION_HEADER_ROT_FRAME_SIZE),
-                minichunk::opt(ids::ANIMATION_HEADER_TRA_FRAME_SIZE),
-                minichunk::opt(ids::ANIMATION_HEADER_SCA_FRAME_SIZE),
-            ))
-            .context(AnimationHeaderCtx)?;
-        Ok(match (rot_frame_size, tra_frame_size, sca_frame_size) {
-            (None, None, None) => Self::parse_v1(chunks, num_frames, fps, num_bones)?,
-            (
-                Some(U32Usize(rot_frame_size)),
-                Some(U32Usize(tra_frame_size)),
-                Some(U32Usize(sca_frame_size)),
-            ) => Self::parse_v2(
-                chunks,
-                num_frames,
-                fps,
-                num_bones,
-                rot_frame_size,
-                tra_frame_size,
-                sca_frame_size,
-            )?,
-            (_, _, _) => Err(FormatError::MixedAnimationFormats)?,
-        })
+        let raw_root = raw::AlaRoot::parse(bytes).context("parsing raw ALA chunk structure")?;
+        Ok(Self::from_raw(raw_root.animation)?)
     }
 }

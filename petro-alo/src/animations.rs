@@ -2,21 +2,36 @@
 #![allow(unused)]
 
 use anyhow::Context;
-use glam::Vec3;
-use petro_chunked::chunks::ChunksIter;
-use petro_chunked::minichunk::mini_chunk_map;
 use thiserror::Error;
 
-use crate::primitives::U32Usize;
-use crate::{AlaFile, ids};
+use crate::AlaFile;
+use crate::error::FormatError;
+use crate::raw;
 
 impl AlaFile {
-    pub(crate) fn parse_v1(
-        mut chunks: ChunksIter,
-        num_frames: usize,
-        fps: f32,
-        num_bones: usize,
-    ) -> Result<Self, anyhow::Error> {
+    pub(crate) fn from_raw(raw: raw::AlaFile<'_>) -> anyhow::Result<Self> {
+        match (
+            raw.header.rot_frame_size,
+            raw.header.tra_frame_size,
+            raw.header.sca_frame_size,
+        ) {
+            (None, None, None) => Self::from_raw_v1(raw),
+            (Some(rot_frame_size), Some(tra_frame_size), Some(sca_frame_size)) => {
+                Self::from_raw_v2(raw, rot_frame_size, tra_frame_size, sca_frame_size)
+            }
+            (_, _, _) => Err(FormatError::MixedAnimationFormats)?,
+        }
+    }
+
+    pub(crate) fn from_raw_v1(raw: raw::AlaFile<'_>) -> anyhow::Result<Self> {
+        let num_bones = raw.header.num_bones;
+        if raw.bones.len() != num_bones {
+            Err(FormatError::WrongContentCount {
+                expected: num_bones,
+                actual: raw.bones.len(),
+            })?;
+        }
+
         #[derive(Error, Debug, Copy, Clone)]
         #[error("parsing the bone data (chunk 0x00001002) for bone index {bidx}")]
         struct BoneAnimCtx {
@@ -24,32 +39,25 @@ impl AlaFile {
         }
 
         let mut bone_animations = Vec::with_capacity(num_bones);
-        for bidx in 0..num_bones {
+        for (bidx, raw_bone) in raw.bones.into_iter().enumerate() {
             let ctx = BoneAnimCtx { bidx };
-            let bone_chunks = chunks
-                .expect_chunk(ids::ANIMATION_BONE_DATA)
-                .context(ctx)?
-                .children()
-                .context(ctx)?;
-            let animation = BoneAnimation::parse_v1(bone_chunks, num_frames)?;
+            let animation =
+                BoneAnimation::from_raw_v1(raw_bone, raw.header.num_frames).context(ctx)?;
             bone_animations.push(animation);
         }
 
         Ok(AlaFile {
-            fps,
+            fps: raw.header.fps,
             bone_animations,
         })
     }
 
-    pub(crate) fn parse_v2(
-        chunks: ChunksIter,
-        num_frames: usize,
-        fps: f32,
-        num_bones: usize,
+    pub(crate) fn from_raw_v2(
+        raw: raw::AlaFile<'_>,
         rot_frame_size: usize,
         tra_frame_size: usize,
         sca_frame_size: usize,
-    ) -> Result<Self, anyhow::Error> {
+    ) -> anyhow::Result<Self> {
         todo!()
     }
 }
@@ -66,40 +74,11 @@ pub struct BoneAnimation {
 }
 
 impl BoneAnimation {
-    fn parse_v1(mut chunks: ChunksIter, num_frames: usize) -> anyhow::Result<Self> {
-        const HEADER: &str = "Parsing the bone data header (chunk 0x00001003)";
-        mini_chunk_map! {
-            Header {
-                [ids::ANIMATION_BONE_DATA_HEADER_NAME] name: String,
-                [ids::ANIMATION_BONE_DATA_HEADER_IDX] bone_index: U32Usize,
-                [ids::ANIMATION_BONE_DATA_HEADER_TRANS_OFFSET] trans_offset: Vec3,
-                [ids::ANIMATION_BONE_DATA_HEADER_TRANS_SCALE] trans_scale: Vec3,
-                [ids::ANIMATION_BONE_DATA_HEADER_SCALE_OFFSET] scale_offset: Vec3,
-                [ids::ANIMATION_BONE_DATA_HEADER_SCALE_SCALE] scale_scale: Vec3,
-                [ids::ANIMATION_BONE_DATA_HEADER_UNKNOWN] unknown_prop: u32 as optional,
-            }
-        }
-        let Header {
-            name,
-            bone_index: U32Usize(bone_index),
-            trans_offset,
-            trans_scale,
-            scale_offset,
-            scale_scale,
-            unknown_prop,
-        } = chunks
-            .expect_chunk(ids::ANIMATION_BONE_DATA_HEADER)
-            .context(HEADER)?
-            .data()
-            .context(HEADER)?
-            .as_mini_chunks()
-            .expect_struct()
-            .context(HEADER)?;
-
+    fn from_raw_v1(raw: raw::BoneAnimation<'_>, num_frames: usize) -> anyhow::Result<Self> {
         Ok(Self {
-            name,
-            bone_index,
-            unknown_prop,
+            name: raw.header.name.to_owned(),
+            bone_index: raw.header.bone_index,
+            unknown_prop: raw.header.unknown_prop,
         })
     }
 }
